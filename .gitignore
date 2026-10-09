@@ -1,0 +1,4 @@
+/target
+/logs
+# credentials live in .env_prod / .env_uat (copied from the Node project), never commit them
+.env_*

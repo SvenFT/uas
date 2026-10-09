@@ -1,0 +1,22 @@
+[package]
+name = "uas"
+version = "1.0.6"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+bcrypt = "0.19.3"
+bytes = "1.12.1"
+chrono = "0.4.45"
+dotenvy = "0.15.7"
+futures-util = "0.3.34"
+jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto"] }
+rdkafka = { version = "0.39.0", default-features = false, features = ["tokio", "cmake-build", "libz-static", "ssl-vendored"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-tungstenite = "0.30.0"
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
