@@ -58,7 +58,11 @@ async fn main() -> anyhow::Result<()> {
 
     // --- kafka + websocket handler --------------------------------------------------------
     let producer = Arc::new(RdKafkaProducer::new(&config.kafka)?);
-    let bus = KafkaBus::new(producer, config.kafka.cluster_node.clone());
+    let bus = KafkaBus::new(producer, config.kafka.cluster_node.clone())
+        .with_symbol_prefix(config.kafka.symbol_prefix.clone());
+    if !config.kafka.symbol_prefix.is_empty() {
+        tracing::info!("prices: Symbol-Praefix {}", config.kafka.symbol_prefix);
+    }
     let prices = Arc::new(PriceConnectionHandler::new());
     let handler = Arc::new(ApiConnectionHandler::new(
         config.system_id.clone(),

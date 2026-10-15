@@ -14,6 +14,7 @@ pub mod config;
 pub mod kafka;
 pub mod kafkasecurity;
 pub mod logging;
+pub mod kafkaproxy_out;
 pub mod prices;
 pub mod telegram;
 pub mod useragent;

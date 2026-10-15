@@ -13,6 +13,16 @@ pub struct KafkaConfig {
     /// Leer = zweiter Cluster aus (KAFKA_PRICES_BROKERS gesetzt, aber leer – z. B. IONOS ohne Topic prices).
     pub prices_brokers: Vec<String>,
     pub prices_client_id: String,
+    /// kafkaproxy-Produce-Modus für das Topic prices (KAFKAPROXY_HOST, leer = aus): gesetzt gehen die
+    /// Nutzerzahlen per TCP an den Proxy ins alte Kafka statt an KAFKA_PRICES_BROKERS.
+    pub proxy_host: String,
+    /// KAFKAPROXY_TOKEN – nur aus der Umgebung, nie loggen.
+    pub proxy_token: String,
+    pub proxy_pending_max: usize,
+    pub proxy_window: usize,
+    /// Präfix vor dem Symbol der Nutzerzahlen (PRICES_SYMBOL_PREFIX, z. B. `CLOUD` → `CLOUD.USERS.<node>`),
+    /// damit im Chart die Umgebung erkennbar ist; leer = wie bisher.
+    pub symbol_prefix: String,
     pub cluster_node: String,
     /// Consumer-Gruppe (KAFKA_GROUP, Vorgabe KAFKA_CLIENT_ID). Je uas-Instanz eindeutig: jede braucht
     /// alle Antworten (cs_user_update, cs_config_live_update) für ihre eigenen Verbindungen.
@@ -65,6 +75,12 @@ fn env_port(key: &str, default: u16) -> u16 {
         .unwrap_or(default)
 }
 
+/// Symbol-Präfix normieren: leer bleibt leer, sonst genau ein Punkt am Ende (`CLOUD` und `CLOUD.` → `CLOUD.`).
+pub fn symbol_prefix(raw: &str) -> String {
+    let p = raw.trim().trim_end_matches('.');
+    if p.is_empty() { String::new() } else { format!("{p}.") }
+}
+
 /// Wie [`broker_list`], aber gesetzt und leer bedeutet "aus" (leere Liste).
 fn optional_broker_list(list_key: &str) -> Vec<String> {
     match env::var(list_key) {
@@ -105,6 +121,11 @@ impl Config {
                 client_id: env_or("KAFKA_CLIENT_ID", "websockerserver_v1"),
                 prices_brokers: optional_broker_list("KAFKA_PRICES_BROKERS"),
                 prices_client_id: env_or("KAFKA_PRICES_CLIENT_ID", "websockerserver_v1"),
+                proxy_host: env_or("KAFKAPROXY_HOST", "").trim().to_string(),
+                proxy_token: env_or("KAFKAPROXY_TOKEN", ""),
+                proxy_pending_max: env_or("KAFKAPROXY_PENDING_MAX", "5000").trim().parse().unwrap_or(5000),
+                proxy_window: env_or("KAFKAPROXY_WINDOW", "200").trim().parse().unwrap_or(200),
+                symbol_prefix: symbol_prefix(&env_or("PRICES_SYMBOL_PREFIX", "")),
                 cluster_node: env_or("CLUSTER_NODE", "undefined"),
                 group_id: env_or("KAFKA_GROUP", &env_or("KAFKA_CLIENT_ID", "websockerserver_v1")),
                 auto_offset_reset: env_or("KAFKA_AUTO_OFFSET_RESET", "earliest"),
@@ -124,6 +145,11 @@ impl Config {
                 client_id: "uas-test".into(),
                 prices_brokers: vec!["localhost:9092".into()],
                 prices_client_id: "uas-test".into(),
+                proxy_host: String::new(),
+                proxy_token: String::new(),
+                proxy_pending_max: 100,
+                proxy_window: 50,
+                symbol_prefix: String::new(),
                 cluster_node: "TEST".into(),
                 group_id: "uas-test".into(),
                 auto_offset_reset: "earliest".into(),
@@ -173,6 +199,15 @@ mod tests {
         unsafe { env::set_var("UAS_TEST_FLAG", "0") };
         assert!(!env_bool("UAS_TEST_FLAG", true));
         unsafe { env::remove_var("UAS_TEST_FLAG") };
+    }
+
+    #[test]
+    fn symbol_prefix_is_normalized() {
+        assert_eq!(symbol_prefix(""), "");
+        assert_eq!(symbol_prefix("  "), "");
+        assert_eq!(symbol_prefix("CLOUD"), "CLOUD.");
+        assert_eq!(symbol_prefix("CLOUD."), "CLOUD.");
+        assert_eq!(symbol_prefix(" cloud.. "), "cloud.");
     }
 
     #[test]

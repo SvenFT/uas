@@ -15,6 +15,7 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde_json::{Value, json};
 
 use crate::config::KafkaConfig;
+use crate::kafkaproxy_out::ProxySink;
 use crate::kafkasecurity::{consumer_session_timeout_ms, kafka_compression, kafka_security};
 
 /// true, sobald der Consumer Partitionen zugeteilt bekommen hat – vorher gingen Antworten des
@@ -74,7 +75,9 @@ pub fn js_now() -> String {
 }
 
 /// `sendUserCountInfo` – produces the "prices" tick messages for users, connections and systems.
+/// `prefix` (PRICES_SYMBOL_PREFIX, normiert mit Punkt) steht vor jedem Symbol, z. B. `CLOUD.USERS.N1`.
 pub fn user_count_messages(
+    prefix: &str,
     cluster_node: &str,
     now_ms: i64,
     user_count: u64,
@@ -93,11 +96,11 @@ pub fn user_count_messages(
         .to_string()
     };
     let mut out = vec![
-        mk(format!("USERS.{cluster_node}"), user_count),
-        mk(format!("WS.CONNECTIONS.{cluster_node}"), connection_count),
+        mk(format!("{prefix}USERS.{cluster_node}"), user_count),
+        mk(format!("{prefix}WS.CONNECTIONS.{cluster_node}"), connection_count),
     ];
     for (system, count) in systems {
-        out.push(mk(format!("WS.SYSTEM.{cluster_node}.{system}"), *count));
+        out.push(mk(format!("{prefix}WS.SYSTEM.{cluster_node}.{system}"), *count));
     }
     out
 }
@@ -106,6 +109,8 @@ pub fn user_count_messages(
 pub struct KafkaBus {
     producer: Arc<dyn KafkaProducer>,
     cluster_node: String,
+    /// Präfix vor den Symbolen der Nutzerzahlen (PRICES_SYMBOL_PREFIX, normiert), leer = keins.
+    symbol_prefix: String,
 }
 
 impl KafkaBus {
@@ -113,7 +118,13 @@ impl KafkaBus {
         KafkaBus {
             producer,
             cluster_node: cluster_node.into(),
+            symbol_prefix: String::new(),
         }
+    }
+
+    pub fn with_symbol_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.symbol_prefix = crate::config::symbol_prefix(&prefix.into());
+        self
     }
 
     pub fn producer(&self) -> Arc<dyn KafkaProducer> {
@@ -153,6 +164,7 @@ impl KafkaBus {
     ) {
         let now_ms = chrono::Utc::now().timestamp_millis();
         for msg in user_count_messages(
+            &self.symbol_prefix,
             &self.cluster_node,
             now_ms,
             user_count,
@@ -173,30 +185,70 @@ pub struct RdKafkaProducer {
     main: FutureProducer,
     /// None: zweiter Cluster aus (KAFKA_PRICES_BROKERS leer) – Nachrichten dorthin entfallen.
     prices: Option<FutureProducer>,
+    /// Some: Nachrichten für Cluster::Prices gehen über den kafkaproxy ins alte Kafka (KAFKAPROXY_HOST),
+    /// der zweite Cluster wird dann nicht benutzt.
+    proxy: Option<Arc<ProxySink>>,
 }
 
 impl RdKafkaProducer {
     pub fn new(cfg: &KafkaConfig) -> Result<Self, rdkafka::error::KafkaError> {
         let main = producer_config(&cfg.brokers, &cfg.client_id).create()?;
-        let prices = if cfg.prices_brokers.is_empty() {
+        let proxy = create_proxy(cfg);
+        let prices = if proxy.is_some() {
+            None
+        } else if cfg.prices_brokers.is_empty() {
             tracing::info!("kafka: zweiter Cluster (prices) aus – KAFKA_PRICES_BROKERS leer, Nutzerzahlen werden nicht gesendet");
             None
         } else {
             // gleiche Sicherheit wie der Hauptcluster
             Some(producer_config(&cfg.prices_brokers, &cfg.prices_client_id).create()?)
         };
-        Ok(RdKafkaProducer { main, prices })
+        Ok(RdKafkaProducer { main, prices, proxy })
     }
+
+    /// Nur für Tests: Hauptcluster ohne Broker-Kontakt, prices über den angegebenen Proxy.
+    pub fn with_proxy(cfg: &KafkaConfig, proxy: Arc<ProxySink>) -> Result<Self, rdkafka::error::KafkaError> {
+        let main = producer_config(&cfg.brokers, &cfg.client_id).create()?;
+        Ok(RdKafkaProducer { main, prices: None, proxy: Some(proxy) })
+    }
+
+    pub fn proxy_stats(&self) -> Option<crate::kafkaproxy_out::Stats> {
+        self.proxy.as_ref().map(|p| p.stats())
+    }
+}
+
+/// KAFKAPROXY_HOST leer = aus; gesetzt ohne Token = aus mit Hinweis. Startet die Sende-Aufgabe.
+fn create_proxy(cfg: &KafkaConfig) -> Option<Arc<ProxySink>> {
+    if cfg.proxy_host.is_empty() {
+        return None;
+    }
+    if cfg.proxy_token.trim().is_empty() {
+        tracing::warn!("kafkaproxy: KAFKAPROXY_HOST gesetzt, aber KAFKAPROXY_TOKEN fehlt - Versand ueber den Proxy aus");
+        return None;
+    }
+    let sink = ProxySink::new(&cfg.proxy_host, &cfg.proxy_token, cfg.proxy_pending_max, cfg.proxy_window);
+    sink.start();
+    tracing::info!(
+        "kafkaproxy: Topic {} an {} (Warteschlange {}, Fenster {}) statt KAFKA_PRICES_BROKERS",
+        TOPIC_PRICES, sink.addr(), sink.queue_cap(), sink.window()
+    );
+    Some(sink)
 }
 
 impl KafkaProducer for RdKafkaProducer {
     fn send(&self, cluster: Cluster, topic: &str, payload: String) {
         let producer = match cluster {
             Cluster::Main => self.main.clone(),
-            Cluster::Prices => match &self.prices {
-                Some(p) => p.clone(),
-                None => return,
-            },
+            Cluster::Prices => {
+                if let Some(proxy) = &self.proxy {
+                    proxy.enqueue(topic, b"", payload.as_bytes());
+                    return;
+                }
+                match &self.prices {
+                    Some(p) => p.clone(),
+                    None => return,
+                }
+            }
         };
         let topic = topic.to_string();
         tokio::spawn(async move {
@@ -302,7 +354,7 @@ mod tests {
         let mut systems = BTreeMap::new();
         systems.insert("MACOS".to_string(), 2);
         systems.insert("WINDOWS".to_string(), 1);
-        let msgs = user_count_messages("N1", 1_700_000_123_456, 3, 5, &systems);
+        let msgs = user_count_messages("", "N1", 1_700_000_123_456, 3, 5, &systems);
         assert_eq!(msgs.len(), 4);
         let first: Value = serde_json::from_str(&msgs[0]).unwrap();
         assert_eq!(first["i"], "USERS.N1");
@@ -346,6 +398,43 @@ mod tests {
         assert!(msgs[..5].iter().all(|(c, _, _)| *c == Cluster::Main));
         assert!(msgs[5..].iter().all(|(c, _, _)| *c == Cluster::Prices));
         assert_eq!(rec.for_topic(TOPIC_ALERT)[0]["a"], 1);
+    }
+
+    #[test]
+    fn symbol_prefix_marks_the_environment() {
+        let mut systems = BTreeMap::new();
+        systems.insert("WEB".to_string(), 2u64);
+        let msgs = user_count_messages("CLOUD.", "N1", 1_700_000_123_456, 3, 5, &systems);
+        let syms: Vec<String> = msgs
+            .iter()
+            .map(|m| serde_json::from_str::<Value>(m).unwrap()["i"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(syms, vec!["CLOUD.USERS.N1", "CLOUD.WS.CONNECTIONS.N1", "CLOUD.WS.SYSTEM.N1.WEB"]);
+        let rec = Arc::new(RecordingProducer::default());
+        let bus = KafkaBus::new(rec.clone(), "N1").with_symbol_prefix("CLOUD");
+        bus.send_user_count_info(1, 2, &BTreeMap::new());
+        assert_eq!(rec.for_topic(TOPIC_PRICES)[0]["i"], "CLOUD.USERS.N1");
+    }
+
+    #[tokio::test]
+    async fn prices_go_to_proxy_when_configured() {
+        use crate::kafkaproxy_out::tests::fake_proxy;
+        let f = fake_proxy("geheim", 0, "").await;
+        let cfg = crate::config::Config::for_tests().kafka;
+        let sink = ProxySink::new(&f.addr, "geheim", 100, 50);
+        sink.start();
+        let producer = RdKafkaProducer::with_proxy(&cfg, sink.clone()).unwrap();
+        producer.send(Cluster::Prices, TOPIC_PRICES, "{\"c\":true,\"i\":\"USERS.ALL\"}".into());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while sink.stats().acked < 1 {
+            assert!(tokio::time::Instant::now() < deadline, "Ack nicht innerhalb von 10 s");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let got = f.got.lock().unwrap().clone();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].topic, TOPIC_PRICES);
+        assert_eq!(got[0].payload, b"{\"c\":true,\"i\":\"USERS.ALL\"}".to_vec());
+        assert_eq!(producer.proxy_stats().unwrap().acked, 1);
     }
 
     #[test]
